@@ -4,6 +4,7 @@ use std::fmt::{Display, Formatter, Result};
 use std::hash::{Hash, Hasher};
 use std::ops::{Add, Div, Mul, Neg, Sub};
 use std::ptr;
+// use std::iter::Sum;
 use std::rc::Rc;
 
 use num_traits::Float;
@@ -23,6 +24,16 @@ impl<T: Float + Copy + Display> Value<T> {
             data: Rc::new(RefCell::new(data)),
             grad: Rc::new(RefCell::new(T::zero())),
             label: "".to_string(),
+            back_prop: None,
+            producers: Vec::new(),
+        }
+    }
+    
+    pub fn new_with_label(data: T, label: &str) -> Self {
+        Self { 
+            data: Rc::new(RefCell::new(data)),
+            grad: Rc::new(RefCell::new(T::zero())),
+            label: label.to_string(),
             back_prop: None,
             producers: Vec::new(),
         }
@@ -54,9 +65,69 @@ impl<T: Float + Copy + Display + std::ops::AddAssign + 'static> Scalar<T> {
         }
     }
 
+    pub fn new_with_label(data: T, label: &str) -> Self {
+        Self {
+            value: Rc::new(RefCell::new(Value::new_with_label(data, label))),
+        }
+    }
+
     fn new_from_value(value: Rc<RefCell<Value<T>>>) -> Self {
         Self {
             value,
+        }
+    }
+
+    pub fn get_data(&self) -> T {
+        self.value.borrow().data.borrow().clone()
+    }
+
+    pub fn get_grad(&self) -> T {
+        self.value.borrow().grad.borrow().clone()
+    }
+
+    pub fn zero_grad(&self) {
+        self.value.borrow_mut().grad.replace(T::zero());
+    }
+    
+    pub fn add_to_data(&self, diff: T) {
+        let new_value = self.get_data() + diff;
+        self.value.borrow_mut().data.replace(new_value);
+    }
+
+    pub fn set_label(&self, label: &str) {
+        self.value.borrow_mut().label = label.to_owned();
+    }
+
+    pub fn get_label(&self) -> String {
+        self.value.borrow_mut().label.clone()
+    }
+    
+    pub fn backward(&self) {
+        // Build a topological ordering of the graph
+        let mut topological_ordering = Vec::<Scalar<T>>::new();
+        let mut visited = HashSet::<Scalar<T>>::new();
+
+        fn visit<T: Float + Copy + Display + std::ops::AddAssign + 'static>(
+            topological_ordering: &mut Vec<Scalar<T>>,
+            visited: &mut HashSet<Scalar<T>>,
+            scalar: &Scalar<T>) {
+            if !visited.contains(scalar) {
+                visited.insert(scalar.clone());
+                for child in scalar.value.borrow().producers.clone() {
+                    visit(topological_ordering, visited, &Scalar::new_from_value(child));
+                }
+                topological_ordering.push(scalar.clone());
+            }
+        }
+        visit(&mut topological_ordering, &mut visited, &self);
+
+        self.value.borrow_mut().grad.replace(T::one());
+        for s in topological_ordering.iter().rev() {
+            if let Some(back_prop) = &s.value.borrow().back_prop {
+                back_prop();
+                let grad = *s.value.borrow().grad.borrow();
+                log::debug!("{}'s gradient: {:.4}", s.value.borrow().label, grad);
+            }
         }
     }
 
@@ -127,43 +198,6 @@ impl<T: Float + Copy + Display + std::ops::AddAssign + 'static> Scalar<T> {
         Scalar::new_from_value(out_value)
     }
 
-    pub fn back_prop(&self) {
-        // Build a topological ordering of the graph
-        let mut topological_ordering = Vec::<Scalar<T>>::new();
-        let mut visited = HashSet::<Scalar<T>>::new();
-
-        fn visit<T: Float + Copy + Display + std::ops::AddAssign + 'static>(
-            topological_ordering: &mut Vec<Scalar<T>>,
-            visited: &mut HashSet<Scalar<T>>,
-            scalar: &Scalar<T>) {
-            if !visited.contains(scalar) {
-                visited.insert(scalar.clone());
-                for child in scalar.value.borrow().producers.clone() {
-                    visit(topological_ordering, visited, &Scalar::new_from_value(child));
-                }
-                topological_ordering.push(scalar.clone());
-            }
-        }
-        visit(&mut topological_ordering, &mut visited, &self);
-
-        self.value.borrow_mut().grad.replace(T::one());
-        for s in topological_ordering.iter().rev() {
-            if let Some(back_prop) = &s.value.borrow().back_prop {
-                back_prop();
-                let grad = *s.value.borrow().grad.borrow();
-                log::debug!("{}'s gradient: {:.4}", s.value.borrow().label, grad);
-            }
-        }
-    }
-
-    pub fn set_label(&self, label: &str) {
-        self.value.borrow_mut().label = label.to_owned();
-    }
-
-    pub fn get_label(&self) -> String {
-        self.value.borrow_mut().label.clone()
-    }
-
     pub fn add_number(&self, number: T) -> Scalar<T> {
         let rhs = Scalar::new(number);
         rhs.set_label(&format!("(Constant {})", number));
@@ -196,8 +230,8 @@ impl<T: Display> Display for Scalar<T> {
 
 impl<T> PartialEq for Scalar<T> {
     fn eq(&self, other: &Self) -> bool {
-        // Two Scalars are equal if they point to the same Value
-        ptr::eq(&*self.value.borrow(), &*other.value.borrow())
+        // Two Scalars are equal if their values are equal
+        self.value.eq(&other.value)
     }
 }
 
@@ -209,7 +243,7 @@ impl<T> Hash for Scalar<T> {
     }
 }
 
-// Operator Overides
+// Operator Overides ----------------------------------------------------------
 
 impl<T: Float + Copy + Display + std::ops::AddAssign + 'static> Add<&Scalar<T>> for &Scalar<T> {
     type Output = Scalar<T>;
@@ -303,3 +337,17 @@ impl<T: Float + Copy + Display + std::ops::AddAssign + 'static> Sub<&Scalar<T>> 
         result
     }
 }
+
+// Other Overrides ------------------------------------------------------------
+
+// TODO: I couldn't quite get this to work, and I'm sick of fighting the compiler over it, so I'll just do a for loop
+// in the one pace I need this
+// impl<T: Float + Copy + Display + std::ops::AddAssign + 'static> Sum<&Scalar<T>> for Scalar<T> {
+//     fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+//         iter.fold(Scalar::new(T::zero()), |acc, x| &acc + &x)
+//         // let mut result = Scalar::new(T::zero());
+//         // for s in iter {
+//         //     result = &result + s;
+//         // }
+//     }
+// }
